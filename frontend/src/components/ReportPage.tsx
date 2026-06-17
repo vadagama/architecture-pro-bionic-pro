@@ -1,28 +1,53 @@
-import React, { useState } from 'react';
-import { useKeycloak } from '@react-keycloak/web';
+import React, { useEffect, useState } from 'react';
+
+// URL бэкенда авторизации (bionicpro-auth / BFF).
+const AUTH_URL = process.env.REACT_APP_AUTH_URL || 'http://localhost:8000';
+
+interface SessionState {
+  authenticated: boolean;
+  username?: string;
+  roles?: string[];
+}
 
 const ReportPage: React.FC = () => {
-  const { keycloak, initialized } = useKeycloak();
+  const [session, setSession] = useState<SessionState | null>(null);
   const [loading, setLoading] = useState(false);
+  const [report, setReport] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const downloadReport = async () => {
-    if (!keycloak?.token) {
-      setError('Not authenticated');
-      return;
-    }
+  // Проверяем статус сессии у BFF. Никаких токенов на клиенте нет —
+  // авторизация определяется по HTTP-only cookie, которую браузер шлёт сам.
+  useEffect(() => {
+    fetch(`${AUTH_URL}/auth/me`, { credentials: 'include' })
+      .then((res) => (res.ok ? res.json() : { authenticated: false }))
+      .then((data) => setSession(data))
+      .catch(() => setSession({ authenticated: false }));
+  }, []);
 
+  const login = () => {
+    // Редирект на BFF, который запускает Authorization Code + PKCE.
+    window.location.href = `${AUTH_URL}/auth/login`;
+  };
+
+  const logout = async () => {
+    await fetch(`${AUTH_URL}/auth/logout`, { method: 'POST', credentials: 'include' });
+    setSession({ authenticated: false });
+    setReport(null);
+  };
+
+  const downloadReport = async () => {
     try {
       setLoading(true);
       setError(null);
-
-      const response = await fetch(`${process.env.REACT_APP_API_URL}/reports`, {
-        headers: {
-          'Authorization': `Bearer ${keycloak.token}`
-        }
-      });
-
-      
+      // Запрос идёт на BFF с сессионной cookie; токен подставляет сам BFF.
+      const response = await fetch(`${AUTH_URL}/api/reports`, { credentials: 'include' });
+      if (response.status === 401) {
+        setSession({ authenticated: false });
+        setError('Session expired, please login again');
+        return;
+      }
+      const data = await response.json();
+      setReport(JSON.stringify(data.report ?? data, null, 2));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
@@ -30,15 +55,15 @@ const ReportPage: React.FC = () => {
     }
   };
 
-  if (!initialized) {
+  if (session === null) {
     return <div>Loading...</div>;
   }
 
-  if (!keycloak.authenticated) {
+  if (!session.authenticated) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
         <button
-          onClick={() => keycloak.login()}
+          onClick={login}
           className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
         >
           Login
@@ -50,8 +75,13 @@ const ReportPage: React.FC = () => {
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
       <div className="p-8 bg-white rounded-lg shadow-md">
-        <h1 className="text-2xl font-bold mb-6">Usage Reports</h1>
-        
+        <div className="flex justify-between items-center mb-6">
+          <h1 className="text-2xl font-bold">Usage Reports</h1>
+          <button onClick={logout} className="text-sm text-gray-500 hover:text-gray-800">
+            Logout ({session.username})
+          </button>
+        </div>
+
         <button
           onClick={downloadReport}
           disabled={loading}
@@ -62,10 +92,14 @@ const ReportPage: React.FC = () => {
           {loading ? 'Generating Report...' : 'Download Report'}
         </button>
 
+        {report && (
+          <pre className="mt-4 p-4 bg-gray-50 text-gray-800 rounded text-xs overflow-auto max-w-md">
+            {report}
+          </pre>
+        )}
+
         {error && (
-          <div className="mt-4 p-4 bg-red-100 text-red-700 rounded">
-            {error}
-          </div>
+          <div className="mt-4 p-4 bg-red-100 text-red-700 rounded">{error}</div>
         )}
       </div>
     </div>
