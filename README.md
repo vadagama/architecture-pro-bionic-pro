@@ -1,3 +1,10 @@
+# BionicPRO — проектная работа
+
+- [Задание 1: повышение безопасности](#bionicpro--задание-1-повышение-безопасности)
+- [Задание 2: сервис отчётов](#задание-2--сервис-отчётов)
+
+---
+
 # BionicPRO — Задание 1: повышение безопасности
 
 Реализация усиления безопасности SSO для системы BionicPRO. Ключевой приём —
@@ -54,10 +61,15 @@ C4-диаграмма контейнеров — в [scheme.drawio](scheme.drawi
 docker compose up --build
 ```
 
-- Frontend: http://localhost:3000
+- Frontend: http://localhost:3002
 - bionicpro-auth (BFF): http://localhost:8000
-- Keycloak: http://localhost:8080 (admin/admin)
+- Keycloak: http://localhost:8082 (admin/admin)
 - OpenLDAP: localhost:389
+
+> Порты Keycloak (8082) и frontend (3002) смещены относительно стандартных
+> 8080/3000, чтобы не конфликтовать с другими локальными сервисами. Меняются в
+> `docker-compose.yaml` (`keycloak.ports`, `frontend.ports`) вместе с
+> `AUTH_KEYCLOAK_PUBLIC_URL` и `AUTH_FRONTEND_URL` сервиса `bionicpro-auth`.
 
 Тестовые пользователи realm: `user1/password123`, `prothetic1/prothetic123`,
 `admin1/admin123`. Пользователи LDAP: `john.doe`, `jane.smith`, `alex.johnson`
@@ -85,3 +97,96 @@ docker compose up --build
   это некритично.
 - Секреты (`client_secret`, пароли) захардкожены для локального стенда; в проде —
   вынести в секрет-менеджер.
+
+---
+
+# Задание 2 — сервис отчётов
+
+Пользователь скачивает отчёт о работе своего протеза. Данные собираются
+ETL-процессом (**Apache Airflow**) из CRM и телеметрии датчиков, складываются в
+витрину **OLAP (ClickHouse)**; бэкенд `reports-api` отдаёт готовый отчёт **только
+по самому пользователю**.
+
+## Архитектура (поток данных)
+
+```
+CRM clients (PostgreSQL) ─┐
+                          ├─► Airflow DAG (ETL, @daily) ─► ClickHouse: bionicpro.user_reports (OLAP-витрина)
+Телеметрия (PostgreSQL) ──┘                                          │
+                                                                     ▼
+Браузер ─cookie─► bionicpro-auth (BFF) ─Bearer JWT─► reports-api ─SQL по username─► ClickHouse
+```
+
+C4-диаграмма — в [scheme.drawio](scheme.drawio) (узлы `reports-api`, `Airflow (ETL)`,
+`OLAP-витрина отчётности`).
+
+## Что сделано (по подзадачам Задания 2)
+
+| # | Подзадача | Где |
+|---|-----------|-----|
+| 1 | Архитектура подготовки/получения отчётов (ETL → OLAP → API) | `scheme.drawio` |
+| 2 | Airflow DAG (ETL CRM→OLAP) + расписание | `airflow/dags/crm_to_olap_etl.py` |
+| 2 | Витрина отчётности (агрегаты по пользователю) | `clickhouse/init/01_mart.sql` |
+| 3 | Бэкенд API `/reports` из OLAP | `reports-api/` |
+| 4 | Ограничение доступа: только свой отчёт | `reports-api/app/auth.py`, `main.py` |
+| 5 | Кнопка получения отчёта в UI | `frontend/src/components/ReportPage.tsx` |
+
+## Источники данных (CRM)
+
+`crm/init/01_schema.sql` + `02_seed.sql` создают в PostgreSQL `crm_db`:
+
+- `clients` — справочник клиентов (`username` совпадает с пользователями Keycloak:
+  `user1`, `user2`, `prothetic1..3`);
+- `prosthesis_telemetry` — сырая телеметрия датчиков за последние ~10 дней
+  (по записи в час). `prothetic3` отключил сбор данных → телеметрии нет.
+
+## Витрина OLAP (ClickHouse)
+
+`bionicpro.user_reports` — `ReplacingMergeTree(generated_at)`,
+`ORDER BY (username, report_date)`. Первичный ключ начинается с `username`, поэтому
+выборка отчёта по пользователю читает узкий диапазон — **быстрый доступ**.
+`ReplacingMergeTree` делает повторный прогон ETL за тот же день идемпотентным.
+
+## ETL (Airflow DAG `crm_to_olap_etl`)
+
+- `extract_and_transform`: вытаскивает телеметрию из CRM и агрегирует в разрезе
+  (пользователь × день), приклеивает атрибуты клиента;
+- `load_to_clickhouse`: грузит агрегаты в витрину;
+- расписание `@daily`, `catchup=False`, идемпотентно (ReplacingMergeTree).
+
+## reports-api (Python, FastAPI)
+
+- `GET /reports` — валидация JWT (RS256-подпись по JWKS Keycloak + issuer),
+  `username` берётся **строго из проверенного токена** (нельзя запросить чужой
+  отчёт), запрос в ClickHouse фильтруется по этому `username`. Опциональные
+  `?from=&to=` ограничивают период. Неаутентифицированный → 401.
+- В витрине только периоды, **уже обработанные Airflow** — будущих/необработанных
+  дат в ответе быть не может по построению.
+- `GET /health` — статус + доступность ClickHouse.
+
+Сервис — bearer-only resource server (клиент `reports-api` в realm). Токен ему
+подставляет BFF (`bionicpro-auth` проксирует `/api/reports` → `reports-api:8000/reports`
+с `Authorization: Bearer`).
+
+## Запуск (дополнительно к Заданию 1)
+
+```bash
+docker compose up --build
+```
+
+- reports-api: http://localhost:8001 (внутри сети — `reports-api:8000`)
+- ClickHouse: http://localhost:8123 (HTTP), localhost:9000 (native)
+- CRM PostgreSQL: localhost:5434
+- Airflow UI: http://localhost:8081 (admin/admin)
+
+После старта зайдите в Airflow UI, включите (unpause) DAG `crm_to_olap_etl` и
+запустите его — витрина наполнится. Затем в UI фронтенда (http://localhost:3002)
+нажмите «Получить отчёт».
+
+## Чек-лист задания
+
+- UI вызывает API генерации отчётов — кнопка «Получить отчёт» → `/api/reports`. ✓
+- Неаутентифицированный не может сгенерировать отчёт — 401 без валидной сессии/JWT. ✓
+- Авторизованный получает только собственный отчёт — `username` из токена. ✓
+- Отчёты берутся из OLAP (ClickHouse), без вычислений в реальном времени. ✓
+- Только обработанные Airflow периоды — в витрине нет необработанных дат. ✓

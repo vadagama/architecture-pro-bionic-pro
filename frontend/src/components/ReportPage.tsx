@@ -9,10 +9,34 @@ interface SessionState {
   roles?: string[];
 }
 
+// Строка витрины отчётности (приходит из reports-api через BFF).
+interface ReportRow {
+  report_date: string;
+  full_name: string;
+  country: string;
+  prosthesis_model: string;
+  serial_number: string;
+  total_sessions: number;
+  total_active_min: number;
+  avg_response_ms: number;
+  max_response_ms: number;
+  avg_signal_quality: number;
+  total_movements: number;
+  avg_battery_pct: number;
+}
+
+interface Report {
+  username: string;
+  report_type: string;
+  periods_count: number;
+  rows: ReportRow[];
+  note?: string;
+}
+
 const ReportPage: React.FC = () => {
   const [session, setSession] = useState<SessionState | null>(null);
   const [loading, setLoading] = useState(false);
-  const [report, setReport] = useState<string | null>(null);
+  const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Проверяем статус сессии у BFF. Никаких токенов на клиенте нет —
@@ -39,17 +63,25 @@ const ReportPage: React.FC = () => {
     try {
       setLoading(true);
       setError(null);
-      // Запрос идёт на BFF с сессионной cookie; токен подставляет сам BFF.
+      setReport(null);
+      // Запрос идёт на BFF с сессионной cookie; токен подставляет сам BFF,
+      // а reports-api отдаёт отчёт ТОЛЬКО по текущему пользователю.
       const response = await fetch(`${AUTH_URL}/api/reports`, { credentials: 'include' });
       if (response.status === 401) {
         setSession({ authenticated: false });
-        setError('Session expired, please login again');
+        setError('Сессия истекла, войдите снова');
         return;
       }
       const data = await response.json();
-      setReport(JSON.stringify(data.report ?? data, null, 2));
+      const payload: Report & { error?: string } = data.report ?? data;
+      // reports-api недоступен / ошибка апстрима — это не "нет данных".
+      if (!response.ok || payload?.error) {
+        setError(payload?.error ? `Сервис отчётов: ${payload.error}` : 'Не удалось получить отчёт');
+        return;
+      }
+      setReport(payload);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
+      setError(err instanceof Error ? err.message : 'Произошла ошибка');
     } finally {
       setLoading(false);
     }
@@ -72,13 +104,15 @@ const ReportPage: React.FC = () => {
     );
   }
 
+  const hasRows = report && report.rows && report.rows.length > 0;
+
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
-      <div className="p-8 bg-white rounded-lg shadow-md">
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 py-8">
+      <div className="p-8 bg-white rounded-lg shadow-md max-w-4xl w-full">
         <div className="flex justify-between items-center mb-6">
-          <h1 className="text-2xl font-bold">Usage Reports</h1>
+          <h1 className="text-2xl font-bold">Отчёт о работе протеза</h1>
           <button onClick={logout} className="text-sm text-gray-500 hover:text-gray-800">
-            Logout ({session.username})
+            Выйти ({session.username})
           </button>
         </div>
 
@@ -89,13 +123,52 @@ const ReportPage: React.FC = () => {
             loading ? 'opacity-50 cursor-not-allowed' : ''
           }`}
         >
-          {loading ? 'Generating Report...' : 'Download Report'}
+          {loading ? 'Формируем отчёт...' : 'Получить отчёт'}
         </button>
 
-        {report && (
-          <pre className="mt-4 p-4 bg-gray-50 text-gray-800 rounded text-xs overflow-auto max-w-md">
-            {report}
-          </pre>
+        {report && !hasRows && (
+          <div className="mt-4 p-4 bg-yellow-50 text-yellow-800 rounded">
+            Данные отчёта ещё не сформированы ETL-процессом (Airflow) для пользователя{' '}
+            <b>{report.username}</b>. Попробуйте позже.
+          </div>
+        )}
+
+        {hasRows && (
+          <div className="mt-6 overflow-auto">
+            <p className="mb-2 text-sm text-gray-600">
+              Пользователь: <b>{report.username}</b> · периодов: {report.periods_count}
+            </p>
+            <table className="min-w-full text-sm border border-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-3 py-2 text-left">Дата</th>
+                  <th className="px-3 py-2 text-left">Модель</th>
+                  <th className="px-3 py-2 text-right">Сессий</th>
+                  <th className="px-3 py-2 text-right">Активность, мин</th>
+                  <th className="px-3 py-2 text-right">Откл., мс (ср/макс)</th>
+                  <th className="px-3 py-2 text-right">Качество сигнала</th>
+                  <th className="px-3 py-2 text-right">Движений</th>
+                  <th className="px-3 py-2 text-right">Батарея, %</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.rows.map((r) => (
+                  <tr key={r.report_date} className="border-t border-gray-100">
+                    <td className="px-3 py-2">{r.report_date}</td>
+                    <td className="px-3 py-2">{r.prosthesis_model}</td>
+                    <td className="px-3 py-2 text-right">{r.total_sessions}</td>
+                    <td className="px-3 py-2 text-right">{r.total_active_min}</td>
+                    <td className="px-3 py-2 text-right">
+                      {r.avg_response_ms} / {r.max_response_ms}
+                    </td>
+                    <td className="px-3 py-2 text-right">{r.avg_signal_quality}</td>
+                    <td className="px-3 py-2 text-right">{r.total_movements}</td>
+                    <td className="px-3 py-2 text-right">{r.avg_battery_pct}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
 
         {error && (

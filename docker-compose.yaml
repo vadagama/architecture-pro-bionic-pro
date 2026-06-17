@@ -1,4 +1,29 @@
-version: '3.8'
+# Якорь общей конфигурации сервисов Airflow (webserver / scheduler / init).
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__SECRET_KEY: bionicpro-airflow-secret
+    # Параметры источников для DAG crm_to_olap_etl
+    CRM_DB_HOST: crm_db
+    CRM_DB_PORT: "5432"
+    CRM_DB_NAME: crm_db
+    CRM_DB_USER: crm_user
+    CRM_DB_PASSWORD: crm_password
+    CLICKHOUSE_HOST: clickhouse
+    CLICKHOUSE_PORT: "8123"
+    CLICKHOUSE_USER: bionic
+    CLICKHOUSE_PASSWORD: bionic
+    CLICKHOUSE_DB: bionicpro
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+  depends_on:
+    - airflow_db
 
 services:
   keycloak_db:
@@ -40,7 +65,7 @@ services:
     volumes:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
     ports:
-      - "8080:8080"
+      - "8082:8080"
     depends_on:
       - keycloak_db
       - openldap
@@ -51,12 +76,12 @@ services:
       dockerfile: Dockerfile
     environment:
       AUTH_KEYCLOAK_INTERNAL_URL: http://keycloak:8080
-      AUTH_KEYCLOAK_PUBLIC_URL: http://localhost:8080
+      AUTH_KEYCLOAK_PUBLIC_URL: http://localhost:8082
       AUTH_REALM: reports-realm
       AUTH_CLIENT_ID: bionicpro-auth
       AUTH_CLIENT_SECRET: bionicpro-auth-secret-change-me
       AUTH_REDIRECT_URI: http://localhost:8000/auth/callback
-      AUTH_FRONTEND_URL: http://localhost:3000
+      AUTH_FRONTEND_URL: http://localhost:3002
       AUTH_API_URL: http://reports-api:8000
       AUTH_SESSION_COOKIE_NAME: bionicpro_session
       AUTH_SESSION_TTL_SECONDS: "1800"
@@ -67,12 +92,103 @@ services:
     depends_on:
       - keycloak
 
+  # --- Задание 2: сервис отчётов ------------------------------------------
+
+  # CRM-источник: справочник клиентов + сырая телеметрия датчиков.
+  crm_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: crm_db
+      POSTGRES_USER: crm_user
+      POSTGRES_PASSWORD: crm_password
+    volumes:
+      - ./crm/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5434:5432"
+
+  # OLAP-витрина отчётности.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    environment:
+      CLICKHOUSE_DB: bionicpro
+      # Выделенный пользователь, доступный по сети из других контейнеров.
+      # (default-пользователь образ ограничивает только localhost.)
+      CLICKHOUSE_USER: bionic
+      CLICKHOUSE_PASSWORD: bionic
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - ./clickhouse/init:/docker-entrypoint-initdb.d
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # Метаданные Airflow.
+  airflow_db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+
+  # Инициализация Airflow: миграции + admin/admin.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@bionicpro.local || true
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8081:8080"
+    depends_on:
+      - airflow_db
+      - airflow-init
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      - airflow_db
+      - airflow-init
+
+  # Бэкенд отчётности: валидирует JWT и отдаёт отчёт из ClickHouse.
+  reports-api:
+    build:
+      context: ./reports-api
+      dockerfile: Dockerfile
+    environment:
+      REPORTS_KEYCLOAK_INTERNAL_URL: http://keycloak:8080
+      REPORTS_REALM: reports-realm
+      REPORTS_CLICKHOUSE_HOST: clickhouse
+      REPORTS_CLICKHOUSE_PORT: "8123"
+      REPORTS_CLICKHOUSE_USER: bionic
+      REPORTS_CLICKHOUSE_PASSWORD: bionic
+      REPORTS_CLICKHOUSE_DB: bionicpro
+    ports:
+      - "8001:8000"
+    depends_on:
+      - keycloak
+      - clickhouse
+
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "3002:3000"
     environment:
       REACT_APP_AUTH_URL: http://localhost:8000
     depends_on:
