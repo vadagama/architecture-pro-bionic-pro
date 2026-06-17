@@ -9,6 +9,7 @@
 - при каждом обращении к защищённому ресурсу выполняется ротация session id
   (защита от session fixation).
 """
+import secrets
 import time
 
 import httpx
@@ -76,12 +77,28 @@ async def health() -> dict:
 
 @app.get("/auth/login")
 async def login() -> RedirectResponse:
-    """Старт авторизации: генерируем PKCE + state, редиректим на Keycloak."""
+    """Старт авторизации: генерируем PKCE + state, редиректим на Keycloak.
+
+    state привязывается к инициировавшему браузеру через короткоживущую
+    HttpOnly-cookie `oauth_state`. В /auth/callback проверяем совпадение
+    state из query-параметра и из cookie — это гарантирует, что callback
+    обрабатывает тот же браузер, который запустил flow (защита от CSRF).
+    """
     code_verifier, code_challenge = generate_pkce()
     state = new_state()
     transient.put(state, {"code_verifier": code_verifier})
     url = keycloak.build_authorize_url(settings, state, code_challenge)
-    return RedirectResponse(url, status_code=302)
+    response = RedirectResponse(url, status_code=302)
+    response.set_cookie(
+        key="oauth_state",
+        value=state,
+        max_age=300,
+        httponly=True,
+        secure=settings.cookie_secure,
+        samesite="lax",
+        path="/auth/callback",
+    )
+    return response
 
 
 @app.get("/auth/callback")
@@ -95,6 +112,12 @@ async def callback(request: Request) -> Response:
     state = request.query_params.get("state")
     if not code or not state:
         return JSONResponse({"error": "missing code or state"}, status_code=400)
+
+    # Проверяем, что state совпадает со значением в cookie браузера —
+    # только тот браузер, который инициировал /auth/login, может завершить flow.
+    cookie_state = request.cookies.get("oauth_state")
+    if not cookie_state or not secrets.compare_digest(cookie_state, state):
+        return JSONResponse({"error": "state mismatch"}, status_code=400)
 
     stashed = transient.pop(state)
     if stashed is None:
@@ -118,6 +141,8 @@ async def callback(request: Request) -> Response:
 
     response = RedirectResponse(settings.frontend_url, status_code=302)
     _set_session_cookie(response, session_id)
+    # Удаляем одноразовую oauth_state cookie — она больше не нужна.
+    response.delete_cookie(key="oauth_state", path="/auth/callback")
     return response
 
 
