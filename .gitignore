@@ -1,0 +1,23 @@
+# Runtime-данные контейнеров (бинды docker-compose)
+postgres-keycloak-data/
+
+# Локальные планы, логи, временные файлы сессии
+tmp/
+
+# Бэкапы и автосейвы draw.io
+*.bkp
+.$*.bkp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Окружение/секреты (кроме примеров)
+.env
+!.env.example
