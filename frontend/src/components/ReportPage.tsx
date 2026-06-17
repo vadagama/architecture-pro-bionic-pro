@@ -29,8 +29,11 @@ interface Report {
   username: string;
   report_type: string;
   periods_count: number;
-  rows: ReportRow[];
+  rows?: ReportRow[];
   note?: string;
+  // Задание 3: BFF/reports-api может вернуть ссылку на отчёт в CDN вместо строк.
+  report_url?: string | null;
+  cached?: boolean;
 }
 
 const ReportPage: React.FC = () => {
@@ -79,6 +82,19 @@ const ReportPage: React.FC = () => {
         setError(payload?.error ? `Сервис отчётов: ${payload.error}` : 'Не удалось получить отчёт');
         return;
       }
+      // Задание 3: если отчёт лежит в S3, BFF вернёт ссылку на CDN — данные
+      // забираем напрямую из CDN (без credentials), разгружая API и OLAP.
+      if (payload.report_url) {
+        const cdnRes = await fetch(payload.report_url);
+        if (!cdnRes.ok) {
+          setError('Не удалось загрузить отчёт из CDN');
+          return;
+        }
+        const cdnData: Report = await cdnRes.json();
+        setReport(cdnData);
+        return;
+      }
+      // Иначе — строки пришли inline (нет данных или S3/CDN недоступны).
       setReport(payload);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Произошла ошибка');

@@ -22,6 +22,21 @@ class Settings(BaseSettings):
     clickhouse_user: str = "default"
     clickhouse_password: str = ""
     clickhouse_db: str = "bionicpro"
+    # Источник витрины. Задание 4: по умолчанию CDC-витрина user_reports_cdc
+    # (наполняется потоком Debezium→Kafka→ClickHouse). Для возврата к витрине
+    # Задания 2 (Airflow ETL) достаточно выставить REPORTS_CLICKHOUSE_SOURCE=user_reports.
+    clickhouse_source: str = "user_reports_cdc"
+
+    # Задание 3: S3 (Minio) + CDN для кэширования готовых отчётов.
+    s3_endpoint: str = "http://minio:9000"
+    s3_access_key: str = "minioadmin"
+    s3_secret_key: str = "minioadmin"
+    s3_bucket: str = "bionicpro-reports"
+    s3_region: str = "us-east-1"
+    # Базовый публичный адрес CDN (Nginx), который видит браузер.
+    cdn_public_base_url: str = "http://localhost:8090"
+    # Секрет для HMAC-ключа объекта (capability-URL). В проде — из секрет-хранилища.
+    report_url_secret: str = "bionicpro-report-secret-change-me"
 
     @property
     def issuer(self) -> str:

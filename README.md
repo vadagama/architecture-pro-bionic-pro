@@ -2,6 +2,8 @@
 
 - [Задание 1: повышение безопасности](#bionicpro--задание-1-повышение-безопасности)
 - [Задание 2: сервис отчётов](#задание-2--сервис-отчётов)
+- [Задание 3: снижение нагрузки на БД (S3 + CDN)](#задание-3--снижение-нагрузки-на-бд-s3--cdn)
+- [Задание 4: оперативность и стабильность CRM (CDC)](#задание-4--оперативность-и-стабильность-crm-cdc)
 
 ---
 
@@ -190,3 +192,177 @@ docker compose up --build
 - Авторизованный получает только собственный отчёт — `username` из токена. ✓
 - Отчёты берутся из OLAP (ClickHouse), без вычислений в реальном времени. ✓
 - Только обработанные Airflow периоды — в витрине нет необработанных дат. ✓
+
+---
+
+# Задание 3 — снижение нагрузки на БД (S3 + CDN)
+
+## Проблема
+
+После внедрения отчётности пользователи часто запрашивают свои отчёты, но между
+прогонами ETL данные не меняются — на одинаковые запросы OLAP отдаёт один и тот
+же результат. Повторные тяжёлые запросы к ClickHouse избыточны.
+
+## Решение — cache-aside через S3 + CDN
+
+Готовый отчёт кэшируется в объектном хранилище (Minio, S3 API) и раздаётся через
+CDN (Nginx reverse-proxy с кэшем). Браузер скачивает отчёт напрямую из CDN, не
+нагружая ни API, ни OLAP.
+
+```
+frontend ──cookie──▶ bionicpro-auth /api/reports ──Bearer──▶ reports-api /reports
+   reports-api:
+     1. probe версии: count() + hash(max(report_date), sum(...))   ← лёгкий запрос
+     2. нет данных            → report_url = null
+     3. key = sub/HMAC(secret, sub:version).json
+     4. HEAD объекта в S3:
+          есть (hit)  → вернуть report_url (OLAP НЕ запрашивается)
+          нет  (miss) → SELECT полного отчёта → PUT в S3 → вернуть report_url
+frontend ──fetch(report_url)──▶ CDN (Nginx) ──proxy_cache──▶ Minio
+```
+
+Тяжёлая выгрузка из OLAP выполняется только при первом запросе новой версии
+данных. Повторные запросы: API делает лишь дешёвый probe, а данные браузер берёт
+из кэша CDN.
+
+## Инвалидация кэша и структура хранения
+
+- **bucket:** `bionicpro-reports`
+- **ключ:** `<sub>/<hmac32>.json`, где `hmac32 = HMAC_SHA256(secret, sub:version)[:32]`
+- **версия (`version`)** = хеш от `max(report_date)`, `sum(total_sessions)`,
+  `sum(total_movements)` по строкам пользователя. Новые данные → новая версия →
+  **новый ключ** → CDN отдаёт свежий объект. Свежесть гарантирует смена ключа, а
+  не TTL, поэтому Nginx кэширует агрессивно (`proxy_cache_valid 200 30d`,
+  `Cache-Control: immutable`).
+- **защита (capability-URL):** bucket разрешает анонимное скачивание, но имя
+  объекта неугадываемо (HMAC). Ссылку выдаёт только API после проверки JWT;
+  угадать чужой ключ нельзя.
+
+## Компоненты
+
+| Файл | Назначение |
+|---|---|
+| `reports-api/app/s3.py` | Клиент S3 (boto3): `report_key` (HMAC), `object_exists`, `put_report`, `build_cdn_url` |
+| `reports-api/app/clickhouse.py` | `fetch_report_meta` — лёгкий probe версии без выгрузки строк |
+| `reports-api/app/main.py` | Cache-aside в `/reports`: probe → S3 HEAD → hit/ссылка или miss/генерация |
+| `nginx/nginx.conf` | CDN: reverse-proxy на `minio:9000` с `proxy_cache`, CORS, `X-Cache-Status` |
+| `docker-compose.yaml` | Сервисы `minio`, `minio-init` (bucket + anonymous download), `cdn` |
+| `frontend/.../ReportPage.tsx` | Получает `report_url`, скачивает отчёт из CDN и рисует таблицу |
+
+## Запуск (дополнительно)
+
+```bash
+docker compose up --build
+```
+
+Дополнительные адреса:
+- CDN (Nginx): http://localhost:8090
+- Minio S3 API: http://localhost:9100, веб-консоль: http://localhost:9101 (minioadmin/minioadmin)
+
+Проверка кэша:
+
+```bash
+# первый запрос пользователя → cache miss (генерация + PUT в S3),
+# повторный → hit (X-Cache-Status: HIT, OLAP не запрашивается)
+curl -sI http://localhost:8090/bionicpro-reports/<sub>/<hmac>.json | grep X-Cache-Status
+```
+
+## Чек-лист задания
+
+- Код схемы взаимодействия с S3 и CDN в сервисе API — `reports-api/app/s3.py` + cache-aside в `main.py`. ✓
+- Файл конфигурации Nginx (reverse proxy) в отдельной папке `nginx/`. ✓
+- Конфигурация развёртывания Nginx добавлена в `docker-compose`. ✓
+- Механизм обновления кэша (версионируемые иммутабельные ключи) и структура хранения в S3 продуманы. ✓
+
+---
+
+# Задание 4 — оперативность и стабильность CRM (CDC)
+
+## Проблема
+
+Массовые выгрузки из CRM (батчевые `SELECT`'ы, как в Airflow ETL Задания 2)
+конкурируют с OLTP-транзакциями CRM: запросы замедляются и падают. Нужно
+**разделить потоки** — выгрузка не должна влиять на транзакционную работу CRM.
+
+## Решение — Change Data Capture
+
+Вместо опроса CRM тяжёлыми запросами изменения читаются из WAL логической
+репликацией (Debezium) и доставляются в ClickHouse потоком через Kafka. Нагрузка
+на CRM от выгрузок практически исчезает — БД лишь пишет WAL, который и так ведёт.
+
+```
+CRM Postgres (clients, prosthesis_telemetry)
+   │  wal_level=logical, pgoutput
+   ▼
+Debezium / Kafka Connect  ──topics──▶  Kafka
+   │   crm.public.clients
+   │   crm.public.prosthesis_telemetry
+   ▼
+ClickHouse KafkaEngine (kafka_clients, kafka_telemetry)
+   │  MaterializedView → landing (clients_raw / telemetry_raw)
+   │  MaterializedView mv_user_reports (JOIN телеметрии и клиентов)
+   ▼
+Витрина user_reports_agg (AggregatingMergeTree)
+   │  VIEW user_reports_cdc (финализация → контракт колонок Задания 2)
+   ▼
+reports-api  /reports  (переключён на user_reports_cdc)
+```
+
+Путь Задания 2 (Airflow + витрина `user_reports`) сохранён и работает параллельно —
+переключение источника API делается переменной `REPORTS_CLICKHOUSE_SOURCE`.
+
+## Компоненты
+
+| Файл | Назначение |
+|---|---|
+| `debezium/register-crm-connector.json` | Конфиг PostgresConnector: `pgoutput`, `table.include.list`, SMT `unwrap` (плоский JSON + `__op`/`__ts_ms`/`__deleted`), `decimal.handling.mode=double`, `time.precision.mode=connect` |
+| `crm/init/03_cdc.sql` | `REPLICA IDENTITY FULL` для таблиц CRM (полный before-образ для update/delete) |
+| `clickhouse/init/02_cdc.sql` | KafkaEngine-таблицы, MaterializedView, витрина `user_reports_agg`, VIEW `user_reports_cdc` |
+| `docker-compose.yaml` | `zookeeper`, `kafka`, `connect`, `connect-init`; `crm_db` запущен с `wal_level=logical` |
+| `reports-api/app/{config,clickhouse}.py` | Источник витрины через `REPORTS_CLICKHOUSE_SOURCE` (по умолчанию `user_reports_cdc`) |
+
+### Витрина через MaterializedView
+
+`mv_user_reports` срабатывает на каждую вставку в `telemetry_raw`, джойнит свежий
+блок телеметрии с актуальными клиентами (`clients_raw FINAL`) и пишет частичные
+агрегаты в `user_reports_agg` (`AggregatingMergeTree` на `SimpleAggregateFunction`).
+VIEW `user_reports_cdc` финализирует агрегаты в те же колонки, что витрина
+Задания 2, поэтому формат ответа `/reports` не меняется.
+
+## Запуск (дополнительно)
+
+```bash
+docker compose up --build
+```
+
+Дополнительные адреса:
+- Kafka Connect REST: http://localhost:8083 (коннектор регистрирует `connect-init` автоматически)
+- Kafka: localhost:9092
+
+Проверка статуса коннектора и потока:
+
+```bash
+# коннектор зарегистрирован и RUNNING
+curl -s http://localhost:8083/connectors/crm-connector/status
+
+# данные доехали в CDC-витрину
+curl -s 'http://localhost:8123/?user=bionic&password=bionic' \
+  --data-binary 'SELECT count() FROM bionicpro.user_reports_cdc'
+```
+
+После старта `/reports` отдаёт данные уже из CDC-витрины (снапшот Debezium
+наполняет её начальными данными автоматически, без запуска Airflow DAG).
+
+## Известное ограничение
+
+Порядок снапшотов между топиками не гарантирован: строка телеметрии, попавшая в
+Kafka раньше своего клиента, будет отброшена INNER JOIN в `mv_user_reports`. Для
+seed-данных клиентов мало (5) и они снапшотятся первыми (`clients` указан первым в
+`table.include.list`), поэтому на практике клиенты приходят раньше телеметрии.
+
+## Чек-лист задания
+
+- Kafka и kafka-connect добавлены в `docker-compose`. ✓
+- Конфиг Debezium-коннектора в папке `debezium/`. ✓
+- Приём данных через KafkaEngine + MaterializedView-витрина в ClickHouse. ✓
+- reports-api переведён на новую витрину (`user_reports_cdc`). ✓
